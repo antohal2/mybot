@@ -1,10 +1,10 @@
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, LabeledPrice, PreCheckoutQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
@@ -13,212 +13,268 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN, ADMIN_IDS, DEFAULT_TRAFFIC_GB, DEFAULT_DAYS
+import config
 from database import (
     init_db, upsert_user, get_active_subscription,
     add_subscription, count_users, count_new_users_today,
-    count_active_subscriptions, deactivate_subscription
+    count_active_subscriptions, deactivate_subscription,
+    get_user_by_id, create_payment, update_payment_status
 )
 from xui_client import xui
+import payments
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# --- FSM States ---
+class Purchase(StatesGroup):
+    choosing_tariff = State()
+    choosing_method = State()
 
-# ── FSM States ───────────────────────────────────────────────
-class CreateSub(StatesGroup):
-    waiting_days = State()
-
-
-# ── Keyboards ────────────────────────────────────────────────
-def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+# --- Keyboards ---
+def get_main_kb(user_id):
     buttons = [
-        [KeyboardButton(text="🆕 Создать подписку"), KeyboardButton(text="📦 Моя подписка")],
+        [KeyboardButton(text="🚀 Моя подписка")],
+        [KeyboardButton(text="💳 Купить подписку")],
+        [KeyboardButton(text="❓ Помощь")]
     ]
-    if is_admin:
-        buttons.append([KeyboardButton(text="👑 Панель администратора")])
+    if user_id in config.ADMIN_IDS:
+        buttons.append([KeyboardButton(text="📊 Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
+def get_tariffs_kb():
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Пробный период (3 дня)", callback_data="tariff_trial")],
+        [InlineKeyboardButton(text="1 месяц - 300₽", callback_data="tariff_1_month")],
+        [InlineKeyboardButton(text="3 месяца - 800₽", callback_data="tariff_3_months")],
+        [InlineKeyboardButton(text="6 месяцев - 1400₽", callback_data="tariff_6_months")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_purchase")]
+    ])
+    return kb
 
-# ── Helpers ──────────────────────────────────────────────────
-def fmt_bytes(b: int) -> str:
-    if b >= 1024 ** 3:
-        return f"{b / 1024 ** 3:.2f} ГБ"
-    elif b >= 1024 ** 2:
-        return f"{b / 1024 ** 2:.2f} МБ"
-    return f"{b / 1024:.1f} КБ"
+def get_payment_methods_kb(tariff_id):
+    buttons = []
+    if config.USE_TELEGRAM_STARS:
+        buttons.append([InlineKeyboardButton(text="⭐ Telegram Stars", callback_data=f"pay_stars_{tariff_id}")])
+    if config.YOOKASSA_SHOP_ID:
+        buttons.append([InlineKeyboardButton(text="💳 ЮKassa (Карты, СБП)", callback_data=f"pay_yookassa_{tariff_id}")])
+    if config.CRYPTOPAY_TOKEN:
+        buttons.append([InlineKeyboardButton(text="💎 CryptoPay (USDT, TON)", callback_data=f"pay_crypto_{tariff_id}")])
+    
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_tariffs")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
-def days_left(expire_at_str: str) -> int:
-    try:
-        expire = datetime.strptime(expire_at_str, "%Y-%m-%d %H:%M:%S")
-        delta = expire - datetime.now()
-        return max(delta.days, 0)
-    except Exception:
-        return 0
-
-
-# ── Handlers ─────────────────────────────────────────────────
+# --- Handlers ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    user = message.from_user
-    upsert_user(user.id, user.username, user.first_name)
-    is_admin = user.id in ADMIN_IDS
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     await message.answer(
-        f"Привет, {user.first_name}!\n\n"
-        "Я бот для управления VPN-подпиской.\n"
-        "Выбери действие:",
-        reply_markup=main_menu(is_admin)
+        f"Привет, {message.from_user.first_name}! 👋
+"
+        "Я помогу тебе получить доступ к быстрому и безопасному VPN.
+
+"
+        "Нажми 'Купить подписку', чтобы начать.",
+        reply_markup=get_main_kb(message.from_user.id)
     )
 
-
-@dp.message(F.text == "🆕 Создать подписку")
-async def create_sub_start(message: Message, state: FSMContext):
-    existing = get_active_subscription(message.from_user.id)
-    if existing:
-        d = days_left(existing["expire_at"])
+@dp.message(F.text == "🚀 Моя подписка")
+async def show_subscription(message: Message):
+    sub = get_active_subscription(message.from_user.id)
+    if sub:
+        expiry = datetime.fromisoformat(sub['expiry_date']).strftime('%d.%m.%Y %H:%M')
         await message.answer(
-            f"У тебя уже есть активная подписка (осталось {d} дн.).\n"
-            "Чтобы создать новую, она будет заменена. Введи количество дней для новой подписки:"
+            "✅ У вас есть активная подписка!
+
+"
+            f"📅 Истекает: {expiry}
+"
+            f"🔗 Ваша ссылка:
+<code>{sub['subscription_url']}</code>
+
+"
+            "Скопируйте ссылку и добавьте её в v2rayNG или Shadowrocket.",
+            parse_mode="HTML"
         )
     else:
         await message.answer(
-            f"Введи количество дней подписки (например, {DEFAULT_DAYS}):"
+            "❌ У вас пока нет активной подписки.
+"
+            "Нажмите 'Купить подписку', чтобы получить доступ."
         )
-    await state.set_state(CreateSub.waiting_days)
 
+@dp.message(F.text == "💳 Купить подписку")
+async def start_purchase(message: Message, state: FSMContext):
+    await state.set_state(Purchase.choosing_tariff)
+    await message.answer("Выберите подходящий тариф:", reply_markup=get_tariffs_kb())
 
-@dp.message(CreateSub.waiting_days)
-async def create_sub_days(message: Message, state: FSMContext):
-    await state.clear()
-    text = message.text.strip()
-    if not text.isdigit() or int(text) <= 0:
-        await message.answer("Пожалуйста, введи целое положительное число дней.")
+@dp.callback_query(F.data.startswith("tariff_"))
+async def process_tariff(callback: CallbackQuery, state: FSMContext):
+    tariff_id = callback.data.replace("tariff_", "")
+    
+    if tariff_id == "trial":
+        # Проверка, был ли уже пробный период
+        # (Упрощенно: просто выдаем)
+        await callback.message.edit_text("⏳ Создаем ваш пробный доступ...")
+        await create_sub_and_notify(callback.from_user.id, 3, "Trial")
+        await state.clear()
         return
 
-    days = int(text)
-    if days > 365:
-        await message.answer("Максимум 365 дней за один раз.")
-        return
-
-    user = message.from_user
-    email = f"tg_{user.id}"
-
-    await message.answer("⏳ Создаю подписку...")
-    try:
-        result = xui.add_client(email=email, days=days, traffic_gb=DEFAULT_TRAFFIC_GB)
-        add_subscription(
-            telegram_id=user.id,
-            client_id=result["client_id"],
-            email=email,
-            expire_at=result["expire_at"],
-            traffic_limit_gb=DEFAULT_TRAFFIC_GB,
-        )
-        await message.answer(
-            f"✅ Подписка создана!\n\n"
-            f"📅 Срок: {days} дней (до {result['expire_at'][:10]})\n"
-            f"📊 Трафик: {DEFAULT_TRAFFIC_GB} ГБ\n\n"
-            f"🔗 Ссылка для подключения:\n"
-            f"<code>{result['link']}</code>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        log.error(f"Ошибка создания подписки: {e}")
-        await message.answer(f"❌ Ошибка при создании подписки: {e}")
-
-
-@dp.message(F.text == "📦 Моя подписка")
-async def my_sub(message: Message):
-    sub = get_active_subscription(message.from_user.id)
-    if not sub:
-        await message.answer(
-            "У тебя нет активной подписки.\n"
-            "Нажми \"🆕 Создать подписку\" чтобы получить доступ."
-        )
-        return
-
-    try:
-        traffic = xui.get_client_traffic(sub["email"])
-        used_up = fmt_bytes(traffic["up"])
-        used_down = fmt_bytes(traffic["down"])
-        total_allowed = fmt_bytes(sub["traffic_limit_gb"] * 1024 ** 3)
-        used_total = fmt_bytes(traffic["up"] + traffic["down"])
-        expire_at = sub["expire_at"]
-        d_left = days_left(expire_at)
-        status = "✅ Активна" if traffic["enable"] else "❌ Заблокирована"
-
-        text = (
-            f"📦 <b>Информация о подписке</b>\n\n"
-            f"Статус: {status}\n"
-            f"📅 Действует до: {expire_at[:10]}\n"
-            f"⏳ Осталось дней: {d_left}\n\n"
-            f"📊 <b>Трафик</b>\n"
-            f"  ⬆️ Отправлено: {used_up}\n"
-            f"  ⬇️ Получено: {used_down}\n"
-            f"  📈 Итого: {used_total} / {total_allowed}\n"
-        )
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Показать ссылку", callback_data="show_link")]
-        ])
-        await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-    except Exception as e:
-        log.error(f"Ошибка получения трафика: {e}")
-        await message.answer(f"❌ Не удалось получить данные: {e}")
-
-
-@dp.callback_query(F.data == "show_link")
-async def show_link_cb(call: CallbackQuery):
-    sub = get_active_subscription(call.from_user.id)
-    if not sub:
-        await call.answer("Подписка не найдена", show_alert=True)
-        return
-    try:
-        inbound = xui.get_inbound()
-        protocol = inbound.get("protocol", "vless")
-        link = xui._build_link(inbound, sub["client_id"], sub["email"], protocol)
-        await call.message.answer(
-            f"🔗 Ссылка для подключения:\n<code>{link}</code>",
-            parse_mode="HTML"
-        )
-        await call.answer()
-    except Exception as e:
-        await call.answer(f"Ошибка: {e}", show_alert=True)
-
-
-# ── Admin handlers ───────────────────────────────────────────
-@dp.message(F.text == "👑 Панель администратора")
-async def admin_panel(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Нет доступа.")
-        return
-    total = count_users()
-    new_today = count_new_users_today()
-    active_subs = count_active_subscriptions()
-    await message.answer(
-        f"👑 <b>Панель администратора</b>\n\n"
-        f"👤 Всего пользователей: {total}\n"
-        f"🆕 Новых сегодня: {new_today}\n"
-        f"📦 Активных подписок: {active_subs}",
-        parse_mode="HTML"
+    await state.update_data(tariff=tariff_id)
+    await state.set_state(Purchase.choosing_method)
+    await callback.message.edit_text(
+        f"Вы выбрали тариф: {tariff_id.replace('_', ' ')}
+"
+        "Выберите способ оплаты:",
+        reply_markup=get_payment_methods_kb(tariff_id)
     )
 
+@dp.callback_query(F.data.startswith("pay_"))
+async def process_payment(callback: CallbackQuery, state: FSMContext):
+    data = callback.data.split("_")
+    method = data[1]
+    tariff_id = "_".join(data[2:])
+    
+    prices = {
+        "1_month": config.PRICE_1_MONTH,
+        "3_months": config.PRICE_3_MONTHS,
+        "6_months": config.PRICE_6_MONTHS
+    }
+    days_map = {
+        "1_month": 30,
+        "3_months": 90,
+        "6_months": 180
+    }
+    
+    amount = prices.get(tariff_id, 0)
+    days = days_map.get(tariff_id, 30)
+    
+    if method == "stars":
+        # Оплата через Telegram Stars
+        await callback.message.answer_invoice(
+            title=f"Подписка VPN ({tariff_id})",
+            description=f"Доступ на {days} дней",
+            payload=f"pay_stars_{callback.from_user.id}_{days}",
+            currency="XTR",
+            prices=[LabeledPrice(label="Оплата", amount=amount)]
+        )
+    elif method == "yookassa":
+        # Оплата через ЮKassa
+        payment_url, payment_id = payments.create_yookassa_payment(amount, f"Подписка {days} дней")
+        if payment_url:
+            create_payment(callback.from_user.id, amount, "rub", "yookassa", payment_id)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Перейти к оплате", url=payment_url)],
+                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_yoo_{payment_id}_{days}")]
+            ])
+            await callback.message.answer("Оплатите счет по ссылке ниже:", reply_markup=kb)
+        else:
+            await callback.message.answer("Ошибка при создании счета. Попробуйте другой способ.")
+    
+    elif method == "crypto":
+        # Оплата через CryptoPay
+        # (Упрощенно: в рублях по курсу или просто фикс)
+        invoice = await payments.create_crypto_payment(amount/100, "USDT", f"VPN {days} days")
+        if invoice:
+             create_payment(callback.from_user.id, amount/100, "USDT", "cryptopay", str(invoice.invoice_id))
+             kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Оплатить в CryptoBot", url=invoice.bot_invoice_url)],
+                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_crypto_{invoice.invoice_id}_{days}")]
+            ])
+             await callback.message.answer("Оплатите счет через CryptoBot:", reply_markup=kb)
+    
+    await callback.answer()
+    await state.clear()
 
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    await admin_panel(message)
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
 
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    if payload.startswith("pay_stars_"):
+        _, _, user_id, days = payload.split("_")
+        await create_sub_and_notify(int(user_id), int(days), "Stars")
 
-# ── Main ─────────────────────────────────────────────────────
+@dp.callback_query(F.data.startswith("check_yoo_"))
+async def check_yoo_payment(callback: CallbackQuery):
+    _, _, payment_id, days = callback.data.split("_")
+    status = payments.check_yookassa_payment(payment_id)
+    
+    if status == "succeeded":
+        update_payment_status(payment_id, "completed")
+        await callback.message.edit_text("✅ Оплата прошла успешно! Создаем подписку...")
+        await create_sub_and_notify(callback.from_user.id, int(days), "YooKassa")
+    else:
+        await callback.answer("Оплата еще не поступила. Попробуйте позже.", show_alert=True)
+
+async def create_sub_and_notify(user_id, days, method):
+    expiry_date = (datetime.now() + timedelta(days=days)).isoformat()
+    
+    # Деактивируем старую подписку если есть
+    old_sub = get_active_subscription(user_id)
+    if old_sub:
+        await xui.delete_client(config.XUI_INBOUND_ID, old_sub['client_email'])
+        deactivate_subscription(user_id)
+
+    email = f"user_{user_id}_{int(datetime.now().timestamp())}@bot"
+    sub_url = await xui.add_client(config.XUI_INBOUND_ID, email, config.DEFAULT_TRAFFIC_GB)
+    
+    if sub_url:
+        add_subscription(user_id, email, sub_url, expiry_date)
+        await bot.send_message(
+            user_id,
+            f"🎉 Подписка успешно активирована!
+
+"
+            f"📅 Срок: {days} дней (через {method})
+"
+            f"📅 Истекает: {expiry_date[:16].replace('T', ' ')}
+
+"
+            f"🔗 Ваша ссылка:
+<code>{sub_url}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await bot.send_message(user_id, "❌ Произошла ошибка при создании подписки. Обратитесь в поддержку.")
+
+# --- Admin Handlers ---
+@dp.message(F.text == "📊 Админ-панель")
+async def admin_panel(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS: return
+    
+    stats = (
+        "📊 Статистика бота:
+
+"
+        f"👥 Всего пользователей: {count_users()}
+"
+        f"🆕 Новых сегодня: {count_new_users_today()}
+"
+        f"💎 Активных подписок: {count_active_subscriptions()}
+"
+    )
+    await message.answer(stats)
+
+@dp.message(Command("add_sub"))
+async def admin_add_sub(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS: return
+    # /add_sub user_id days
+    try:
+        _, user_id, days = message.text.split()
+        await create_sub_and_notify(int(user_id), int(days), "Admin")
+    except:
+        await message.answer("Использование: /add_sub user_id days")
+
 async def main():
     init_db()
-    log.info("Bot started")
+    log.info("Starting bot...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
