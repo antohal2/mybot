@@ -91,6 +91,11 @@ def get_user(telegram_id: int):
     return row
 
 
+def get_user_by_id(telegram_id: int):
+    """Alias for get_user for compatibility."""
+    return get_user(telegram_id)
+
+
 def is_trial_used(telegram_id: int) -> bool:
     user = get_user(telegram_id)
     if not user:
@@ -204,6 +209,19 @@ def confirm_payment(payment_id: int, provider_payment_id: str = None):
     conn.close()
 
 
+def update_payment_status(payment_id: int, status: str, provider_payment_id: str = None):
+    """Update payment status (pending, paid, failed, etc.)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE payments
+        SET status=?, provider_payment_id=?, updated_at=datetime('now')
+        WHERE id=?
+    """, (status, provider_payment_id, payment_id))
+    conn.commit()
+    conn.close()
+
+
 def get_payment(payment_id: int):
     conn = get_connection()
     cur = conn.cursor()
@@ -240,7 +258,7 @@ def get_expired_subscriptions():
     cur = conn.cursor()
     cur.execute("""
         SELECT * FROM subscriptions
-        WHERE is_active=1 AND datetime(expiry_date) < datetime('now')
+        WHERE is_active=1 AND datetime(expire_at) < datetime('now')
     """)
     rows = cur.fetchall()
     conn.close()

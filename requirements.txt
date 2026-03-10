@@ -1,11 +1,11 @@
 # Core dependencies
-aiogram==3.7.0
+aiogram>=3.8.0,<4.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 
 # Payment providers (optional, install as needed)
 # YooKassa
-yookassa>=3.0.0
+yookassa>=3.0.0,<4.0.0
 
-# CryptoPay
-aiocryptopay>=0.4.0
+# CryptoPay (aiocryptopay - updated with compatible version)
+aiocryptopay>=0.5.1,<1.0.0

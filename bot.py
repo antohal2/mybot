@@ -50,7 +50,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # Rate limiting
 dp.message.middleware(RateLimitMiddleware(rate_limit=1))
-dp.message.middleware(RateLimitMiddleware(rate_limit=1))
 
 async def cleanup_expired_subscriptions():
     """Background task to deactivate expired subscriptions."""
@@ -71,9 +70,6 @@ async def cleanup_expired_subscriptions():
         except Exception as e:
             log.error(f"Error in cleanup: {e}")
             await asyncio.sleep(60)
-
-# Start background task
-asyncio.create_task(cleanup_expired_subscriptions())
 
 # --- FSM States ---
 class Purchase(StatesGroup):
@@ -128,7 +124,7 @@ async def cmd_start(message: Message):
 async def show_subscription(message: Message):
     sub = get_active_subscription(message.from_user.id)
     if sub:
-        expiry = datetime.fromisoformat(sub['expiry_date']).strftime('%d.%m.%Y %H:%M')
+        expiry = datetime.fromisoformat(sub['expire_at']).strftime('%d.%m.%Y %H:%M')
         await message.answer(
             "✅ У вас есть активная подписка!\n\n"
             f"📅 Истекает: {expiry}\n"
@@ -196,7 +192,7 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
         if payment:
             payment_url = payment["confirmation_url"]
             payment_id = payment["id"]
-            create_payment(callback.from_user.id, amount, "rub", "yookassa", payment_id)
+            create_payment(callback.from_user.id, tariff_id, amount, "RUB", "yookassa")
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Перейти к оплате", url=payment_url)],
                 [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_yoo_{payment_id}_{days}")]
@@ -210,12 +206,12 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
         # (Упрощенно: в рублях по курсу или просто фикс)
         invoice = await payments.create_cryptopay_invoice(amount/100, f"VPN {days} days")
         if invoice:
-             create_payment(callback.from_user.id, amount/100, "USDT", "cryptopay", str(invoice["invoice_id"]))
-             kb = InlineKeyboardMarkup(inline_keyboard=[
+            create_payment(callback.from_user.id, tariff_id, int(amount), "USDT", "cryptopay")
+            kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Оплатить в CryptoBot", url=invoice["bot_invoice_url"])],
                 [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_crypto_{invoice['invoice_id']}_{days}")]
             ])
-             await callback.message.answer("Оплатите счет через CryptoBot:", reply_markup=kb)
+            await callback.message.answer("Оплатите счет через CryptoBot:", reply_markup=kb)
     
     await callback.answer()
     await state.clear()
@@ -240,6 +236,20 @@ async def check_yoo_payment(callback: CallbackQuery):
         update_payment_status(payment_id, "completed")
         await callback.message.edit_text("✅ Оплата прошла успешно! Создаем подписку...")
         await create_sub_and_notify(callback.from_user.id, int(days), "YooKassa")
+    else:
+        await callback.answer("Оплата еще не поступила. Попробуйте позже.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("check_crypto_"))
+async def check_crypto_payment(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    invoice_id = int(parts[2])
+    days = int(parts[3]) if len(parts) > 3 else 30
+    
+    status = await payments.check_cryptopay_invoice(invoice_id)
+    
+    if status == "paid":
+        await callback.message.edit_text("✅ Оплата прошла успешно! Создаем подписку...")
+        await create_sub_and_notify(callback.from_user.id, days, "CryptoPay")
     else:
         await callback.answer("Оплата еще не поступила. Попробуйте позже.", show_alert=True)
 
@@ -296,7 +306,16 @@ async def admin_add_sub(message: Message):
 async def main():
     init_db()
     log.info("Starting bot...")
-    await dp.start_polling(bot)
+    # Start background cleanup task
+    cleanup_task = asyncio.create_task(cleanup_expired_subscriptions())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
