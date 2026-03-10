@@ -7,5 +7,5 @@ python-dotenv>=1.0.0
 # YooKassa
 yookassa>=3.0.0,<4.0.0
 
-# CryptoPay (aiocryptopay - updated with compatible version)
-aiocryptopay>=0.5.1,<1.0.0
+# CryptoPay (aiocryptopay - use stable 0.4.x version)
+aiocryptopay>=0.4.0,<0.5.0
