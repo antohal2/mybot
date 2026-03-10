@@ -232,3 +232,16 @@ def count_paid_today():
     result = cur.fetchone()[0]
     conn.close()
     return result
+
+
+def get_expired_subscriptions():
+    """Get all active subscriptions that have expired."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM subscriptions
+        WHERE is_active=1 AND datetime(expiry_date) < datetime('now')
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows

@@ -38,6 +38,9 @@ CRYPTO_PAY_NET    = os.getenv("CRYPTO_PAY_NET", "mainnet")  # or "testnet"
 # Active payment method: "stars" | "yookassa" | "cryptopay" | "manual"
 PAYMENT_METHOD = os.getenv("PAYMENT_METHOD", "stars")
 
+# Use Telegram Stars
+USE_TELEGRAM_STARS = os.getenv("USE_TELEGRAM_STARS", "true").lower() == "true"
+
 # ── Subscription plans ────────────────────────────────────────────────────────
 # Format: id -> {days, price, label, traffic_gb}
 PLANS = {
@@ -74,3 +77,8 @@ PLANS = {
         "traffic_gb": 300,
     },
 }
+
+# Legacy price vars (for backward compatibility)
+PRICE_1_MONTH = PLANS["1m"]["price"]
+PRICE_3_MONTHS = PLANS["3m"]["price"]
+PRICE_6_MONTHS = PLANS["6m"]["price"]

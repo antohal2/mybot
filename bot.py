@@ -12,22 +12,68 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.middleware import BaseMiddleware
+import time
 
 import config
 from database import (
     init_db, upsert_user, get_active_subscription,
     add_subscription, count_users, count_new_users_today,
     count_active_subscriptions, deactivate_subscription,
-    get_user_by_id, create_payment, update_payment_status
+    get_user_by_id, create_payment, update_payment_status,
+    get_expired_subscriptions
 )
 from xui_client import xui
 import payments
+
+# Rate limiting middleware
+class RateLimitMiddleware(BaseMiddleware):
+    def __init__(self, rate_limit=1):
+        self.rate_limit = rate_limit
+        self.user_last_time = {}
+
+    async def __call__(self, handler, event, data):
+        user_id = getattr(event.from_user, 'id', None)
+        if user_id:
+            now = time.time()
+            last_time = self.user_last_time.get(user_id, 0)
+            if now - last_time < self.rate_limit:
+                return  # Ignore the event
+            self.user_last_time[user_id] = now
+        return await handler(event, data)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# Rate limiting
+dp.message.middleware(RateLimitMiddleware(rate_limit=1))
+dp.message.middleware(RateLimitMiddleware(rate_limit=1))
+
+async def cleanup_expired_subscriptions():
+    """Background task to deactivate expired subscriptions."""
+    while True:
+        try:
+            expired_subs = get_expired_subscriptions()
+            for sub in expired_subs:
+                # Deactivate in DB
+                deactivate_subscription(sub['telegram_id'])
+                # Delete from 3x-ui
+                try:
+                    xui.delete_client(sub['client_id'])
+                except Exception as e:
+                    log.error(f"Failed to delete client {sub['client_id']}: {e}")
+            if expired_subs:
+                log.info(f"Deactivated {len(expired_subs)} expired subscriptions")
+            await asyncio.sleep(3600)  # every hour
+        except Exception as e:
+            log.error(f"Error in cleanup: {e}")
+            await asyncio.sleep(60)
+
+# Start background task
+asyncio.create_task(cleanup_expired_subscriptions())
 
 # --- FSM States ---
 class Purchase(StatesGroup):
@@ -48,9 +94,9 @@ def get_main_kb(user_id):
 def get_tariffs_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Пробный период (3 дня)", callback_data="tariff_trial")],
-        [InlineKeyboardButton(text="1 месяц - 300₽", callback_data="tariff_1_month")],
-        [InlineKeyboardButton(text="3 месяца - 800₽", callback_data="tariff_3_months")],
-        [InlineKeyboardButton(text="6 месяцев - 1400₽", callback_data="tariff_6_months")],
+        [InlineKeyboardButton(text=config.PLANS["1m"]["label"], callback_data="tariff_1m")],
+        [InlineKeyboardButton(text=config.PLANS["3m"]["label"], callback_data="tariff_3m")],
+        [InlineKeyboardButton(text=config.PLANS["6m"]["label"], callback_data="tariff_6m")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_purchase")]
     ])
     return kb
@@ -72,11 +118,8 @@ def get_payment_methods_kb(tariff_id):
 async def cmd_start(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     await message.answer(
-        f"Привет, {message.from_user.first_name}! 👋
-"
-        "Я помогу тебе получить доступ к быстрому и безопасному VPN.
-
-"
+        f"Привет, {message.from_user.first_name}! 👋\n"
+        "Я помогу тебе получить доступ к быстрому и безопасному VPN.\n\n"
         "Нажми 'Купить подписку', чтобы начать.",
         reply_markup=get_main_kb(message.from_user.id)
     )
@@ -87,22 +130,15 @@ async def show_subscription(message: Message):
     if sub:
         expiry = datetime.fromisoformat(sub['expiry_date']).strftime('%d.%m.%Y %H:%M')
         await message.answer(
-            "✅ У вас есть активная подписка!
-
-"
-            f"📅 Истекает: {expiry}
-"
-            f"🔗 Ваша ссылка:
-<code>{sub['subscription_url']}</code>
-
-"
+            "✅ У вас есть активная подписка!\n\n"
+            f"📅 Истекает: {expiry}\n"
+            f"🔗 Ваша ссылка:\n<code>{sub['subscription_url']}</code>\n\n"
             "Скопируйте ссылку и добавьте её в v2rayNG или Shadowrocket.",
             parse_mode="HTML"
         )
     else:
         await message.answer(
-            "❌ У вас пока нет активной подписки.
-"
+            "❌ У вас пока нет активной подписки.\n"
             "Нажмите 'Купить подписку', чтобы получить доступ."
         )
 
@@ -126,8 +162,7 @@ async def process_tariff(callback: CallbackQuery, state: FSMContext):
     await state.update_data(tariff=tariff_id)
     await state.set_state(Purchase.choosing_method)
     await callback.message.edit_text(
-        f"Вы выбрали тариф: {tariff_id.replace('_', ' ')}
-"
+        f"Вы выбрали тариф: {tariff_id.replace('_', ' ')}\n"
         "Выберите способ оплаты:",
         reply_markup=get_payment_methods_kb(tariff_id)
     )
@@ -138,19 +173,13 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
     method = data[1]
     tariff_id = "_".join(data[2:])
     
-    prices = {
-        "1_month": config.PRICE_1_MONTH,
-        "3_months": config.PRICE_3_MONTHS,
-        "6_months": config.PRICE_6_MONTHS
-    }
-    days_map = {
-        "1_month": 30,
-        "3_months": 90,
-        "6_months": 180
-    }
+    plan = config.PLANS.get(tariff_id)
+    if not plan:
+        await callback.answer("Неверный тариф")
+        return
     
-    amount = prices.get(tariff_id, 0)
-    days = days_map.get(tariff_id, 30)
+    amount = plan["price"] if method == "yookassa" else plan["stars"]
+    days = plan["days"]
     
     if method == "stars":
         # Оплата через Telegram Stars
@@ -163,8 +192,10 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
         )
     elif method == "yookassa":
         # Оплата через ЮKassa
-        payment_url, payment_id = payments.create_yookassa_payment(amount, f"Подписка {days} дней")
-        if payment_url:
+        payment = payments.create_yookassa_payment(amount, f"Подписка {days} дней", "https://t.me/your_bot")  # replace with actual bot url
+        if payment:
+            payment_url = payment["confirmation_url"]
+            payment_id = payment["id"]
             create_payment(callback.from_user.id, amount, "rub", "yookassa", payment_id)
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Перейти к оплате", url=payment_url)],
@@ -177,12 +208,12 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
     elif method == "crypto":
         # Оплата через CryptoPay
         # (Упрощенно: в рублях по курсу или просто фикс)
-        invoice = await payments.create_crypto_payment(amount/100, "USDT", f"VPN {days} days")
+        invoice = await payments.create_cryptopay_invoice(amount/100, f"VPN {days} days")
         if invoice:
-             create_payment(callback.from_user.id, amount/100, "USDT", "cryptopay", str(invoice.invoice_id))
+             create_payment(callback.from_user.id, amount/100, "USDT", "cryptopay", str(invoice["invoice_id"]))
              kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Оплатить в CryptoBot", url=invoice.bot_invoice_url)],
-                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_crypto_{invoice.invoice_id}_{days}")]
+                [InlineKeyboardButton(text="Оплатить в CryptoBot", url=invoice["bot_invoice_url"])],
+                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_crypto_{invoice['invoice_id']}_{days}")]
             ])
              await callback.message.answer("Оплатите счет через CryptoBot:", reply_markup=kb)
     
@@ -218,26 +249,22 @@ async def create_sub_and_notify(user_id, days, method):
     # Деактивируем старую подписку если есть
     old_sub = get_active_subscription(user_id)
     if old_sub:
-        await xui.delete_client(config.XUI_INBOUND_ID, old_sub['client_email'])
+        await xui.delete_client(old_sub['client_id'])
         deactivate_subscription(user_id)
 
     email = f"user_{user_id}_{int(datetime.now().timestamp())}@bot"
-    sub_url = await xui.add_client(config.XUI_INBOUND_ID, email, config.DEFAULT_TRAFFIC_GB)
+    result = await xui.add_client(email, days, config.DEFAULT_TRAFFIC_GB)
     
-    if sub_url:
-        add_subscription(user_id, email, sub_url, expiry_date)
+    if result:
+        client_id = result['client_id']
+        sub_url = result['link']
+        add_subscription(user_id, client_id, email, expiry_date, config.DEFAULT_TRAFFIC_GB, "custom")
         await bot.send_message(
             user_id,
-            f"🎉 Подписка успешно активирована!
-
-"
-            f"📅 Срок: {days} дней (через {method})
-"
-            f"📅 Истекает: {expiry_date[:16].replace('T', ' ')}
-
-"
-            f"🔗 Ваша ссылка:
-<code>{sub_url}</code>",
+            f"🎉 Подписка успешно активирована!\n\n"
+            f"📅 Срок: {days} дней (через {method})\n"
+            f"📅 Истекает: {expiry_date[:16].replace('T', ' ')}\n\n"
+            f"🔗 Ваша ссылка:\n<code>{sub_url}</code>",
             parse_mode="HTML"
         )
     else:
@@ -249,15 +276,10 @@ async def admin_panel(message: Message):
     if message.from_user.id not in config.ADMIN_IDS: return
     
     stats = (
-        "📊 Статистика бота:
-
-"
-        f"👥 Всего пользователей: {count_users()}
-"
-        f"🆕 Новых сегодня: {count_new_users_today()}
-"
-        f"💎 Активных подписок: {count_active_subscriptions()}
-"
+        "📊 Статистика бота:\n\n"
+        f"👥 Всего пользователей: {count_users()}\n"
+        f"🆕 Новых сегодня: {count_new_users_today()}\n"
+        f"💎 Активных подписок: {count_active_subscriptions()}\n"
     )
     await message.answer(stats)
 
